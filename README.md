@@ -45,14 +45,14 @@ MARINER/
 
 └── Logs/                   # Directory for CSV telemetry recordings
 
-
+```
 MARINER/
 ├── Tasks/                  # Directory for saved JSON scenario configurations
 ├── Logs/                   # Directory for simulation log exports
 ├── ship_simulation.py      # Main entry point: PyQt5 GUI and simulation loop
 ├── llm_controller.py       # API integrations and VTS Swarm prompt logic
 └── collision_analyzer.py   # Math engine for CPA, TCPA, Risk, and COLREGs
-
+```
 
 
 ## Installation & Dependencies
