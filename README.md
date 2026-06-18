@@ -34,10 +34,15 @@ Collision risks are calculated using a Z-shaped fuzzy logic membership function 
 ## Project Structure
 
 MARINER/
+
 ├── ship_simulation.py      # Main entry point: PyQt5 GUI and simulation loop
+
 ├── llm_controller.py       # API integrations and VTS Swarm prompt logic
+
 ├── collision_analyzer.py   # Math engine for CPA, TCPA, Risk, and COLREGs
+
 ├── Tasks/                  # Directory for saved JSON scenario configurations
+
 └── Logs/                   # Directory for CSV telemetry recordings
 
 ## Installation & Dependencies
