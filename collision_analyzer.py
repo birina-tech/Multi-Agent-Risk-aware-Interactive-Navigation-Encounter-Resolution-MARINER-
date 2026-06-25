@@ -1,326 +1,328 @@
 """
 collision_analyzer.py
-Анализ столкновений и правил МППСС для симуляции судов.
-Основан на алгоритмах из статьи "Large Language Model-based Decision-making for COLREGs..."
+Анализ столкновений и определение правил МППСС
 """
-import sys
 import numpy as np
-from PyQt5.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
-                             QLabel, QTableWidget, QTableWidgetItem, QHeaderView,
-                             QStatusBar, QScrollArea, QAbstractItemView, QApplication)
-from PyQt5.QtCore import QTimer, Qt
-from PyQt5.QtGui import QFont, QColor
-import warnings
-warnings.filterwarnings("ignore")
+from PyQt5.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+                             QPushButton, QLabel, QTableWidget, QTableWidgetItem,
+                             QHeaderView, QGroupBox, QScrollArea)
+from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtGui import QColor 
+from colreg_rules import determine_colreg_situation
 
 
 class CollisionAnalyzer:
-    """Класс для расчета CPA, TCPA, Risk Index и правил МППСС"""
-    
-    def __init__(self):
-        self.max_distance_nm = 12.0  # Максимальная дистанция анализа (морские мили)
-        self.max_distance_m = self.max_distance_nm * 1852.0  # Перевод в метры
+    """Анализатор столкновений"""
     
     def calculate_cpa_tcpa(self, ship1, ship2):
         """
-        Расчет CPA и TCPA по формулам (13) и (14) из статьи.
-        DCPA(t) = R(t) * sin(alpha(t))
-        TCPA(t) = R(t) * cos(alpha(t)) / Vrel(t)
+        Рассчитать CPA (Distance at Closest Point of Approach) и TCPA (Time to CPA)
         """
         dx = ship2.x - ship1.x
         dy = ship2.y - ship1.y
         dist = np.sqrt(dx**2 + dy**2)
         
-        # Скорости в глобальной системе (X=Восток, Y=Север)
-        # В ship_simulation.py: psi=0 это Север (+Y)
         v1_x = ship1.u * np.sin(ship1.psi)
         v1_y = ship1.u * np.cos(ship1.psi)
         v2_x = ship2.u * np.sin(ship2.psi)
         v2_y = ship2.u * np.cos(ship2.psi)
         
-        # Относительная скорость
         v_rel_x = v2_x - v1_x
         v_rel_y = v2_y - v1_y
         v_rel = np.sqrt(v_rel_x**2 + v_rel_y**2)
         
-        if v_rel > 0.01:
-            # Углы как в cpa_calculations.py
-            psi_LOS = np.arctan2(dy, dx)
-            psi_v_rel = np.arctan2(-v_rel_y, -v_rel_x)
-            alpha = psi_LOS - psi_v_rel
-            
-            DCPA = abs(dist * np.sin(alpha))
-            TCPA = (dist * np.cos(alpha)) / v_rel
-            TCPA = max(0, TCPA)  # TCPA не может быть отрицательным
-        else:
-            DCPA = dist
-            TCPA = float('inf')
+        if v_rel < 0.1:
+            return {
+                'dist': dist,
+                'DCPA': dist,
+                'TCPA': float('inf'),
+                'v_rel': v_rel
+            }
+        
+        v_rel_norm_x = v_rel_x / v_rel
+        v_rel_norm_y = v_rel_y / v_rel
+        
+        proj = dx * v_rel_norm_x + dy * v_rel_norm_y
+        tcpa = -proj / v_rel
+        
+        if tcpa < 0:
+            tcpa = 0
+        
+        cpa_x = dx + v_rel_x * tcpa
+        cpa_y = dy + v_rel_y * tcpa
+        dcpa = np.sqrt(cpa_x**2 + cpa_y**2)
         
         return {
             'dist': dist,
-            'DCPA': DCPA,
-            'TCPA': TCPA,
+            'DCPA': dcpa,
+            'TCPA': tcpa,
             'v_rel': v_rel
         }
     
     def calculate_risk_index(self, dcpa, tcpa, dist):
         """
-        Расчет индекса риска по формуле (15) из статьи:
-        Risk(t) = (f(DCPA) + f(TCPA) + f(R(t))) / 3
-        где f - Z-shaped Fuzzy Membership функция.
-        Пороги из Eq. (3): DCPA < 250м, TCPA < 60с, R < 1000м.
+        Рассчитать индекс риска (0-1)
         """
-        f_DCPA = max(0, min(1, (1000 - dcpa) / (1000 - 250))) if dcpa < 1000 else 0
-        f_TCPA = max(0, min(1, (300 - tcpa) / (300 - 60))) if tcpa < 300 else 0
-        f_Range = max(0, min(1, (2000 - dist) / (2000 - 1000))) if dist < 2000 else 0
+        dcpa_risk = max(0, min(1, (1000 - dcpa) / 1000))
+        tcpa_risk = max(0, min(1, (600 - tcpa) / 600))
+        dist_risk = max(0, min(1, (5000 - dist) / 5000))
         
-        return (f_DCPA + f_TCPA + f_Range) / 3
+        risk_index = (dcpa_risk + tcpa_risk + dist_risk) / 3
+        
+        return risk_index
     
-    def determine_colreg_rule(self, ship1, ship2):
+    def calculate_course_crossing(self, ship1, ship2):
         """
-        Определение правила МППСС по классификации из Eq. (2) и decision_making.py.
-        relative_bearing = psi - los_ob
+        Определить, какое судно пересекает курс другого по носу.
+        
+        Логика:
+        1. Найти точку пересечения ЛИНИЙ КУРСОВ (геометрических прямых)
+        2. Вычислить, какое судно быстрее достигнет этой точки
+        3. То судно, которое придёт раньше, и пересекает курс другого по носу
+        
+        Returns:
+            dict с результатами анализа
         """
-        dx = ship2.x - ship1.x
-        dy = ship2.y - ship1.y
-        los_ob = np.arctan2(dy, dx)
-        
-        # Относительный пеленг (нормализованный в [-pi, pi])
-        rel_bearing = ship1.psi - los_ob
-        rel_bearing = np.arctan2(np.sin(rel_bearing), np.cos(rel_bearing))
-        rel_bearing_deg = np.degrees(rel_bearing)
-        
-        # Классификация ситуаций
-        if abs(rel_bearing_deg) <= 6:
-            # Head-on (Rule 14)
-            return 14, 'both-give-way', 'both-give-way'
-        
-        elif 6 < rel_bearing_deg <= 112:
-            # Crossing - Give way (Rule 15)
-            return 15, 'give-way', 'stand-on'
-        
-        elif -118 <= rel_bearing_deg < -6:
-            # Crossing - Stand on (Rule 17)
-            return 17, 'stand-on', 'give-way'
-        
-        elif rel_bearing_deg > 112 or rel_bearing_deg < -118:
-            # Overtaking (Rule 13)
-            # Определяем, кто обгоняет (кто быстрее)
-            if ship1.u > ship2.u:
-                return 13, 'give-way', 'stand-on'
-            else:
-                return 13, 'stand-on', 'give-way'
-        
-        return 0, 'none', 'none'
-    
-    def get_required_action(self, rule_num, role):
-        """Определение требуемого действия"""
-        if rule_num == 0 or role == 'none':
-            return "Нет действий"
-        
-        actions = {
-            (14, 'both-give-way'): "Изменить курс ВПРАВО",
-            (13, 'give-way'): "Уступить дорогу (не пересекать курс)",
-            (13, 'stand-on'): "Сохранять курс и скорость",
-            (15, 'give-way'): "Изменить курс ВПРАВО / Снизить скорость",
-            (15, 'stand-on'): "Сохранять курс и скорость",
-            (17, 'stand-on'): "Сохранять курс и скорость",
-            (17, 'give-way'): "Изменить курс ВПРАВО / Снизить скорость"
+        result = {
+            'crossing_point': None,
+            'crosses_1_by_2': False,
+            'crosses_2_by_1': False,
+            'time_1_to_cross': None,
+            'time_2_to_cross': None,
+            'time_gap': None,
+            'crossing_type': None,
         }
         
-        return actions.get((rule_num, role), "Анализ ситуации")
+        # Направления движения
+        sin1, cos1 = np.sin(ship1.psi), np.cos(ship1.psi)
+        sin2, cos2 = np.sin(ship2.psi), np.cos(ship2.psi)
+        
+        dx = ship2.x - ship1.x
+        dy = ship2.y - ship1.y
+        
+        # Определитель системы
+        D = sin2 * cos1 - cos2 * sin1  # = sin(ψ2 - ψ1)
+        
+        if abs(D) < 1e-6:
+            # Курсы параллельны — пересечения нет
+            return result
+        
+        # Параметры вдоль линий курсов (в метрах)
+        s = (dy * sin2 - dx * cos2) / D   # для судна 1
+        t = (dy * sin1 - dx * cos1) / D   # для судна 2
+        
+        # Точка пересечения (через судно 1)
+        cross_x = ship1.x + s * sin1
+        cross_y = ship1.y + s * cos1
+        result['crossing_point'] = (cross_x, cross_y)
+        
+        # Проверяем, впереди ли точка для обоих судов
+        point_ahead_of_ship1 = s > 0
+        point_ahead_of_ship2 = t > 0
+        
+        if not (point_ahead_of_ship1 and point_ahead_of_ship2):
+            # Точка позади хотя бы одного судна — пересечения по носу нет
+            return result
+        
+        # Обе точки впереди — считаем времена
+        if ship1.u < 0.1 or ship2.u < 0.1:
+            return result
+        
+        time_1 = s / ship1.u  # секунды
+        time_2 = t / ship2.u  # секунды
+        
+        result['time_1_to_cross'] = time_1
+        result['time_2_to_cross'] = time_2
+        result['time_gap'] = abs(time_1 - time_2)
+        
+        # УБРАНО условие проверки разницы во времени > 60 секунд
+        # Теперь пересечение фиксируется всегда, если точка впереди обоих судов
+        
+        # Определяем, кто пересёк курс
+        if time_1 < time_2:
+            # Судно 1 придёт раньше → оно пересечёт курс судна 2 по носу
+            result['crosses_2_by_1'] = True
+            result['crossing_type'] = f'{ship1.name} crosses {ship2.name} ahead'
+        else:
+            # Судно 2 придёт раньше → оно пересечёт курс судна 1 по носу
+            result['crosses_1_by_2'] = True
+            result['crossing_type'] = f'{ship2.name} crosses {ship1.name} ahead'
+        
+        return result
 
 
 class CollisionAnalysisWindow(QMainWindow):
-    """Окно отображения таблицы анализа столкновений"""
+    """Окно анализа столкновений"""
     
     def __init__(self, ships_ref):
         super().__init__()
         self.ships_ref = ships_ref
         self.analyzer = CollisionAnalyzer()
         
-        self.setWindowTitle(" Анализ столкновений и МППСС")
+        self.setWindowTitle("ColRegs Analysis")
         self.resize(1400, 700)
         
         self.init_ui()
         
         self.timer = QTimer()
-        self.timer.timeout.connect(self.update_analysis)
-        self.timer.start(1000)  # Обновление каждую секунду
+        self.timer.timeout.connect(self.update_table)
+        self.timer.start(1000)
+        
+        self.update_table()
     
     def init_ui(self):
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
-        main_layout = QVBoxLayout(central_widget)
+        layout = QVBoxLayout(central_widget)
         
-        title_label = QLabel("📊 Таблица анализа столкновений (CPA/TCPA/МППСС)")
-        title_label.setFont(QFont("Arial", 14, QFont.Bold))
+        title_label = QLabel("Interaction of each pair of vessels in the context of the COLREGs")
+        title_label.setStyleSheet("font-size: 16px; font-weight: bold; padding: 10px;")
         title_label.setAlignment(Qt.AlignCenter)
-        main_layout.addWidget(title_label)
+        layout.addWidget(title_label)
         
-        info_label = QLabel(
-            "Анализ пар судов на дистанции ≤ 12 морских миль (22 224 м). "
-            "Цветовая индикация: 🔴 критично | 🟠 высоко | 🟡 средне | 🟢 низкий риск | ⚪ нет угрозы"
-        )
-        info_label.setWordWrap(True)
-        info_label.setStyleSheet("color: gray; font-size: 10px;")
-        main_layout.addWidget(info_label)
-        
-        scroll_area = QScrollArea()
-        scroll_area.setWidgetResizable(True)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         
         self.table = QTableWidget()
-        self.table.setColumnCount(7)
+        self.table.setColumnCount(12)  # 12 колонок (добавлена Crosses ahead)
         self.table.setHorizontalHeaderLabels([
-            "Пара судов",
-            "Дистанция (м)",
-            "CPA (м)",
-            "TCPA (с)",
-            "Risk Index",
-            "Правило МППСС",
-            "Требуемые действия"
+            "Pair",
+            "Distance (m)",
+            "CPA (m)",
+            "TCPA (s)",
+            "Risk",
+            "Rule №",
+            "Situation",
+            "Bearing 1→2",
+            "Bearing 2→1",
+            "Crosses ahead",  # НОВАЯ КОЛОНКА
+            f"Action {self.ships_ref[0].name if len(self.ships_ref) > 0 else 'Ship1'}",
+            f"Action {self.ships_ref[1].name if len(self.ships_ref) > 1 else 'Ship2'}"
         ])
         
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.table.setAlternatingRowColors(True)
-        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.table.setStyleSheet("""
-            QTableWidget {
-                font-size: 11px;
-                gridline-color: #cccccc;
-            }
-            QTableWidget::item {
-                padding: 5px;
-            }
-            QHeaderView::section {
-                background-color: #4a90d9;
-                color: white;
-                font-weight: bold;
-                padding: 8px;
-            }
-        """)
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.Interactive)
         
-        scroll_area.setWidget(self.table)
-        main_layout.addWidget(scroll_area)
+        self.table.setColumnWidth(0, 150)
+        self.table.setColumnWidth(1, 80)
+        self.table.setColumnWidth(2, 80)
+        self.table.setColumnWidth(3, 80)
+        self.table.setColumnWidth(4, 60)
+        self.table.setColumnWidth(5, 70)
+        self.table.setColumnWidth(6, 150)
+        self.table.setColumnWidth(7, 90)
+        self.table.setColumnWidth(8, 90)
+        self.table.setColumnWidth(9, 200)  # Crosses ahead
         
-        self.statusBar().showMessage("Ожидание данных...")
+        scroll.setWidget(self.table)
+        layout.addWidget(scroll)
+        
+        btn_close = QPushButton("Close window")
+        btn_close.clicked.connect(self.close)
+        layout.addWidget(btn_close)
     
-    def update_analysis(self):
-        """Обновление таблицы анализа"""
-        if not self.ships_ref or len(self.ships_ref) < 2:
+    def update_table(self):
+        """Обновить таблицу анализа"""
+        ships = self.ships_ref() if callable(self.ships_ref) else self.ships_ref
+        
+        if len(ships) < 2:
             self.table.setRowCount(0)
-            self.statusBar().showMessage("Недостаточно судов для анализа (нужно ≥ 2)")
             return
         
-        ships = self.ships_ref
-        n = len(ships)
+        self.table.setRowCount(0)
+        
         row = 0
-        
-        # Количество уникальных пар
-        num_pairs = n * (n - 1) // 2
-        self.table.setRowCount(num_pairs)
-        
-        for i in range(n):
-            for j in range(i + 1, n):
+        for i in range(len(ships)):
+            for j in range(i + 1, len(ships)):
                 ship1 = ships[i]
                 ship2 = ships[j]
                 
-                # 1. Расчет CPA/TCPA
                 cpa_data = self.analyzer.calculate_cpa_tcpa(ship1, ship2)
-                
-                # 2. Расчет индекса риска
                 risk_index = self.analyzer.calculate_risk_index(
                     cpa_data['DCPA'], cpa_data['TCPA'], cpa_data['dist']
                 )
                 
-                # 3. Определение правила МППСС (только если дистанция < 12 миль)
-                if cpa_data['dist'] < self.analyzer.max_distance_m:
-                    rule_num, role1, role2 = self.analyzer.determine_colreg_rule(ship1, ship2)
-                    action1 = self.analyzer.get_required_action(rule_num, role1)
-                    action2 = self.analyzer.get_required_action(rule_num, role2)
-                    
-                    if rule_num > 0:
-                        rule_text = f"Правило {rule_num}"
-                        actions_text = f"{ship1.name}: {action1}\n{ship2.name}: {action2}"
-                    else:
-                        rule_text = "—"
-                        actions_text = "Нет угрозы"
-                    
-                    risk_color = self.get_risk_color(cpa_data['DCPA'], cpa_data['TCPA'], cpa_data['dist'])
+                colreg_data = determine_colreg_situation(
+                    ship1, ship2,
+                    cpa_data['dist'], cpa_data['DCPA'], cpa_data['TCPA']
+                )
+                
+                # Расчет пересечения курсов
+                crossing_data = self.analyzer.calculate_course_crossing(ship1, ship2)
+                
+                self.table.insertRow(row)
+                
+                pair_item = QTableWidgetItem(f"{ship1.name} ↔ {ship2.name}")
+                self.table.setItem(row, 0, pair_item)
+                
+                dist_item = QTableWidgetItem(f"{cpa_data['dist']:.0f}")
+                self.table.setItem(row, 1, dist_item)
+                
+                cpa_item = QTableWidgetItem(f"{cpa_data['DCPA']:.0f}")
+                self.table.setItem(row, 2, cpa_item)
+                
+                tcpa_val = cpa_data['TCPA']
+                tcpa_str = f"{tcpa_val:.0f}" if tcpa_val != float('inf') else ""
+                tcpa_item = QTableWidgetItem(tcpa_str)
+                self.table.setItem(row, 3, tcpa_item)
+                
+                risk_item = QTableWidgetItem(f"{risk_index:.2f}")
+                self.table.setItem(row, 4, risk_item)
+                
+                if risk_index > 0.7:
+                    color = Qt.red
+                elif risk_index > 0.4:
+                    color = Qt.yellow
                 else:
-                    rule_text = "> 12 миль"
-                    actions_text = "—"
-                    risk_color = QColor(240, 240, 240)
+                    color = Qt.green
                 
-                # 4. Заполнение строки таблицы
-                self.table.setItem(row, 0, QTableWidgetItem(f"{ship1.name} ↔ {ship2.name}"))
-                self.table.setItem(row, 1, QTableWidgetItem(f"{cpa_data['dist']:.0f}"))
-                self.table.setItem(row, 2, QTableWidgetItem(f"{cpa_data['DCPA']:.0f}"))
+                for col in range(5):
+                    self.table.item(row, col).setBackground(color)
                 
-                tcpa_text = f"{cpa_data['TCPA']:.0f}" if cpa_data['TCPA'] != float('inf') else "∞"
-                self.table.setItem(row, 3, QTableWidgetItem(tcpa_text))
-                self.table.setItem(row, 4, QTableWidgetItem(f"{risk_index:.2f}"))
-                self.table.setItem(row, 5, QTableWidgetItem(rule_text))
-                self.table.setItem(row, 6, QTableWidgetItem(actions_text))
+                rule_item = QTableWidgetItem(f"Rule {colreg_data['rule']}")
+                self.table.setItem(row, 5, rule_item)
                 
-                # Применяем цветовую индикацию ко всей строке
-                for col in range(7):
-                    item = self.table.item(row, col)
-                    if item:
-                        item.setBackground(risk_color)
+                situation_item = QTableWidgetItem(colreg_data['situation'])
+                self.table.setItem(row, 6, situation_item)
+                
+                details = colreg_data.get('details', {})
+                bearing_1_to_2 = details.get('bearing_1_to_2', None)
+                bearing_2_to_1 = details.get('bearing_2_to_1', None)
+                
+                if bearing_1_to_2 is not None:
+                    bearing_1_item = QTableWidgetItem(f"{bearing_1_to_2:.0f}°")
+                    self.table.setItem(row, 7, bearing_1_item)
+                else:
+                    self.table.setItem(row, 7, QTableWidgetItem("-"))
+                
+                if bearing_2_to_1 is not None:
+                    bearing_2_item = QTableWidgetItem(f"{bearing_2_to_1:.0f}°")
+                    self.table.setItem(row, 8, bearing_2_item)
+                else:
+                    self.table.setItem(row, 8, QTableWidgetItem("-"))
+                
+                # НОВАЯ КОЛОНКА 9: Crosses ahead
+                if crossing_data['crossing_type']:
+                    cross_text = f"{crossing_data['crossing_type']}\n(t={min(crossing_data['time_1_to_cross'], crossing_data['time_2_to_cross']):.0f}s)"
+                    cross_item = QTableWidgetItem(cross_text)
+                    cross_item.setBackground(QColor(255, 200, 200))
+                    self.table.setItem(row, 9, cross_item)
+                else:
+                    self.table.setItem(row, 9, QTableWidgetItem("No crossing"))
+                
+                action1_item = QTableWidgetItem(colreg_data['ship1_action'])
+                self.table.setItem(row, 10, action1_item)
+                
+                action2_item = QTableWidgetItem(colreg_data['ship2_action'])
+                self.table.setItem(row, 11, action2_item)
                 
                 row += 1
-        
-        # Обновление статусной строки
-        active_pairs = sum(
-            1 for i in range(n) 
-            for j in range(i + 1, n) 
-            if self.analyzer.calculate_cpa_tcpa(ships[i], ships[j])['dist'] < self.analyzer.max_distance_m
-        )
-        
-        self.statusBar().showMessage(
-            f"Всего пар: {num_pairs} | "
-            f"Активных (≤ 12 миль): {active_pairs} | "
-            f"Судов в симуляции: {n}"
-        )
-    
-    def get_risk_color(self, dcpa, tcpa, dist):
-        """Цветовая индикация риска по порогам из статьи (Eq. 3)"""
-        if dcpa < 250 and tcpa < 60:
-            return QColor(255, 100, 100)  # Красный - критический
-        elif dcpa < 500 and tcpa < 120:
-            return QColor(255, 180, 100)  # Оранжевый - высокий
-        elif dcpa < 1000 and tcpa < 300:
-            return QColor(255, 255, 150)  # Желтый - средний
-        elif dist < self.analyzer.max_distance_m * 0.5:
-            return QColor(200, 255, 200)  # Зеленый - низкий
-        else:
-            return QColor(240, 240, 240)  # Серый - нет угрозы
 
 
 def launch_collision_analysis(ships_ref):
-    """Функция для запуска окна анализа из основной симуляции"""
+    """Запустить окно анализа столкновений"""
     window = CollisionAnalysisWindow(ships_ref)
     window.show()
     return window
-
-
-if __name__ == "__main__":
-    # Для тестирования создаем фиктивные суда
-    class TestShip:
-        def __init__(self, x, y, psi_deg, u, name):
-            self.x = x
-            self.y = y
-            self.psi = np.deg2rad(psi_deg)
-            self.u = u
-            self.name = name
-    
-    test_ships = [
-        TestShip(0, 0, 0, 5, "Ship_1"),
-        TestShip(2000, 0, 180, 5, "Ship_2"),
-        TestShip(1000, 2000, 270, 4, "Ship_3")
-    ]
-    
-    app = QApplication([])
-    window = launch_collision_analysis(test_ships)
-    app.exec_()

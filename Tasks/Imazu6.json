@@ -1,0 +1,31 @@
+{
+  "vessels": [
+    {
+      "name": "Ship_1",
+      "x": 2.472187886280153,
+      "y": -4016.069221260816,
+      "course_deg": 0.0,
+      "speed_ms": 5.0,
+      "rudder_deg": 0.0,
+      "rpm_percent": 50.0
+    },
+    {
+      "name": "Ship_2",
+      "x": 5997.527812113722,
+      "y": 1.236093943139167,
+      "course_deg": 315.0,
+      "speed_ms": 5.0,
+      "rudder_deg": 0.0,
+      "rpm_percent": 50.0
+    },
+    {
+      "name": "Ship_3",
+      "x": 2017.3053152039556,
+      "y": -2013.5970333745367,
+      "course_deg": 340.0,
+      "speed_ms": 5.0,
+      "rudder_deg": 0.0,
+      "rpm_percent": 50.0
+    }
+  ]
+}

@@ -59,15 +59,15 @@ class LLMCoordinator:
             'key_env': 'OPENROUTER_API_KEY'
         }
     }
-    
+
     def __init__(self, provider='ollama', model=None, api_key=None):
         self.provider = provider
         config = self.PROVIDERS.get(provider, self.PROVIDERS['ollama'])
-        
+
         self.url = config['url']
         self.model = model or config['default_model']
         self.needs_key = config['needs_key']
-        
+
         # API ключ: явно переданный > переменная окружения
         if api_key:
             self.api_key = api_key
@@ -75,43 +75,91 @@ class LLMCoordinator:
             self.api_key = os.environ.get(config['key_env'], '')
         else:
             self.api_key = None
-        
-        self.system_prompt = """You are an AI Vessel Traffic Coordinator. 
-Your task: Given a complete collision analysis table for ALL vessel pairs, 
-generate coordinated rudder and RPM commands for EACH vessel to avoid collisions 
-while strictly complying with COLREGs.
 
-INPUT: You receive a table with columns:
-- Pair: vessel names
-- Distance (m), CPA (m), TCPA (s), Risk Index
-- COLREG Rule (13/14/15/17)
-- Required actions for each vessel
+        self.system_prompt = """You are an AI Vessel Traffic Controller.
+You receive PRE-CALCULATED data. Your ONLY task: output rudder and RPM values.
+You do NOT determine COLREG rules. Rules are already determined by the code.
+You do NOT calculate CPA/TCPA. These are already calculated.
 
-OUTPUT: JSON with commands for EACH vessel:
+INPUT FORMAT (JSON):
+{
+  "ships": [
+    {
+      "name": "Ship_1",
+      "current_heading_deg": 45,
+      "base_heading_deg": 45,
+      "heading_diff_deg": 15,
+      "speed_ms": 5.0,
+      "current_rudder": 0,
+      "current_rpm": 50,
+      "status": "MUST_YIELD" | "HOLD_COURSE" | "RETURN_TO_COURSE",
+      "no_left_turn": true | false,
+      "in_maneuver": true | false,
+      "pairs": [
+        {
+          "other_ship": "Ship_2",
+          "rule": "14" | "15" | "13" | "17.2",
+          "role": "GIVE_WAY" | "STAND_ON" | "BOTH_ALTER",
+          "cpa_m": 500,
+          "tcpa_s": 120,
+          "crosses_ahead": "Ship_2 crosses Ship_1 ahead" | null
+        }
+      ]
+    }
+  ]
+}
+
+OUTPUT FORMAT (strict JSON only, no extra text):
 {
   "vessel_commands": {
-    "Ship_1": {"rudder_deg": 15, "rpm_percent": 50, "reasoning": "..."},
-    "Ship_2": {"rudder_deg": 0, "rpm_percent": 50, "reasoning": "..."}
+    "Ship_1": {
+      "rudder_deg": 15,
+      "rpm_percent": 50,
+      "reasoning": "Brief explanation: Rule 15 give-way vessel, turning starboard to pass astern"
+    }
   }
 }
 
-COORDINATION RULES:
-1. If a vessel appears in MULTIPLE pairs, prioritize the MOST CRITICAL situation:
-   - Priority order: Head-on (Rule 14) > Crossing give-way (Rule 15) > Overtaking (Rule 13) > Crossing stand-on (Rule 17)
-2. For Head-on (Rule 14): BOTH vessels must turn STARBOARD (positive rudder)
-3. For Crossing (Rule 15): Give-way vessel turns STARBOARD, stand-on vessel maintains
-4. For Overtaking (Rule 13): Overtaking vessel keeps clear, overtaken maintains
-5. Avoid contradictory commands: if two vessels are in head-on, BOTH must turn right
-6. ECO-MODE: Prefer rudder changes over RPM changes. Keep RPM at 50% unless emergency.
-7. Smooth maneuvers: Avoid sharp rudder changes (>15° at once).
+RULES (follow strictly):
 
-CRITICAL THRESHOLDS:
-- Risk > 0.75 or TCPA < 60s or CPA < 250m: URGENT action required
-- Risk 0.5-0.75: Begin maneuver
-- Risk < 0.5: Maintain course if stand-on, minor adjustments if give-way
+1. STATUS PRIORITY:
+   - If status == "MUST_YIELD" -> you MUST maneuver (change rudder or RPM).
+   - If status == "HOLD_COURSE" -> keep rudder=0, rpm=50 (maintain course and speed).
+   - If status == "RETURN_TO_COURSE" -> gradually steer toward base_heading_deg.
+   - If a ship is MUST_YIELD for one pair but HOLD_COURSE for another -> MUST_YIELD wins.
 
-Respond STRICTLY with valid JSON. No extra text."""
-        
+2. MANEUVER DIRECTION (HARD RULE):
+   - ALWAYS prefer STARBOARD turn (positive rudder).
+   - CRITICAL CONVERGENCE (Rule 17.2 / Emergency / CPA < 1000m): YOU MUST TURN STARBOARD. Port turn (negative rudder) is STRICTLY FORBIDDEN in emergencies.
+   - If no_left_turn == true -> rudder_deg MUST be >= 0. Negative values are FORBIDDEN.
+   - If status == "HOLD_COURSE" -> rudder_deg MUST be 0, rpm_percent MUST be 50. NO MANEUVERS ALLOWED for stand-on vessels.
+   - If status == "MUST_YIELD" -> rudder_deg MUST be >= 0 (STARBOARD turn ONLY). NEGATIVE RUDDER IS STRICTLY FORBIDDEN.
+   - If status == "RETURN_TO_COURSE" -> small rudder toward base_heading, max +/-10 deg.
+
+3. MANEUVER MAGNITUDE:
+   - For Rule 14 (head-on): rudder 15-25 deg starboard.
+   - For Rule 15 (crossing, give-way): rudder 15-25 deg starboard.
+   - For Rule 13 (overtaking): rudder 10-20 deg away from overtaken vessel.
+   - For Rule 17.2 (critical convergence / emergency): rudder 20-35 deg STARBOARD. Reduce RPM to 30-40% if CPA < 500m.
+   - Smooth changes: max 15 deg rudder change per step.
+
+4. RETURN TO BASE COURSE:
+   - If status == "RETURN_TO_COURSE":
+     * Calculate direction to base_heading_deg.
+     * Use small rudder (5-10 deg) toward base course.
+     * If heading_diff_deg < 5 deg -> set rudder=0 (course restored).
+     * Maintain RPM at 50% during return.
+
+5. ECO-MODE:
+   - Prefer rudder changes over RPM changes.
+   - Keep RPM at 50% unless CPA < 1000m or emergency.
+   - If reducing RPM: min 30%, never 0%.
+
+6. NO MANEUVER NEEDED:
+   - If status == "HOLD_COURSE" AND not returning -> rudder=0, rpm=50.
+
+Respond with valid JSON only. No markdown, no explanation outside JSON."""
+
         # Статус подключения
         self.last_status = None
         self.last_error = None
@@ -120,10 +168,8 @@ Respond STRICTLY with valid JSON. No extra text."""
         """Проверка подключения к провайдеру. Возвращает (success, message)"""
         try:
             if self.provider == 'ollama':
-                # Проверяем, запущена ли Ollama
                 r = requests.get('http://localhost:11434/api/tags', timeout=5)
                 if r.status_code == 200:
-                    # Проверяем, есть ли нужная модель
                     models = r.json().get('models', [])
                     model_names = [m.get('name', '') for m in models]
                     if any(self.model in m for m in model_names):
@@ -132,7 +178,7 @@ Respond STRICTLY with valid JSON. No extra text."""
                         return False, f"Модель {self.model} не найдена. Доступны: {', '.join(model_names[:5])}"
                 else:
                     return False, "Ollama вернула ошибку"
-            
+
             elif self.provider == 'anthropic':
                 if not self.api_key:
                     return False, "API ключ не установлен"
@@ -140,7 +186,6 @@ Respond STRICTLY with valid JSON. No extra text."""
                     'x-api-key': self.api_key,
                     'anthropic-version': '2023-06-01'
                 }
-                # Простой запрос для проверки
                 payload = {
                     'model': self.model,
                     'max_tokens': 10,
@@ -151,7 +196,7 @@ Respond STRICTLY with valid JSON. No extra text."""
                     return True, "Подключение к Anthropic успешно"
                 else:
                     return False, f"Ошибка {r.status_code}: {r.text[:100]}"
-            
+
             else:  # OpenAI-совместимые API
                 if not self.api_key:
                     return False, "API ключ не установлен"
@@ -166,31 +211,19 @@ Respond STRICTLY with valid JSON. No extra text."""
                     return True, f"Подключение к {self.provider} успешно"
                 else:
                     return False, f"Ошибка {r.status_code}: {r.text[:100]}"
-        
+
         except requests.exceptions.ConnectionError:
             return False, f"Нет соединения с {self.provider}. Проверьте интернет/запуск сервиса."
         except Exception as e:
             return False, f"Ошибка: {str(e)[:100]}"
 
     def format_analysis_table(self, ships, collision_data):
-        table_text = "CURRENT VESSEL STATES:\n"
-        for ship in ships:
-            table_text += (f"{ship.name}: pos=({ship.x:.0f},{ship.y:.0f}), "
-                           f"heading={ship.get_heading_deg():.0f}°, "
-                           f"speed={ship.u:.1f} m/s, "
-                           f"rudder={ship.rudder_cmd:.0f}°, rpm={ship.rpm_cmd:.0f}%\n")
-        
-        table_text += "\nCOLLISION ANALYSIS TABLE:\n"
-        table_text += "Pair | Distance(m) | CPA(m) | TCPA(s) | Risk | Rule | Actions\n"
-        table_text += "-" * 80 + "\n"
-        
-        for pair_data in collision_data:
-            tcpa_str = f"{pair_data['tcpa']:.0f}" if pair_data['tcpa'] != float('inf') else "inf"
-            table_text += (f"{pair_data['pair']} | {pair_data['dist']:.0f} | "
-                           f"{pair_data['cpa']:.0f} | {tcpa_str} | "
-                           f"{pair_data['risk']:.2f} | Rule {pair_data['rule']} | "
-                           f"{pair_data['actions']}\n")
-        return table_text
+        """Форматирование данных для LLM.
+        collision_data — словарь {'ships': [...]} от collect_collision_data().
+        Передаём как JSON — LLM получает готовые факты, не сырые данные.
+        """
+        import json
+        return json.dumps(collision_data, indent=2, ensure_ascii=False)
 
     def _call_openai_compatible(self, user_message):
         headers = {
@@ -244,13 +277,13 @@ Respond STRICTLY with valid JSON. No extra text."""
 
     def get_coordinated_commands(self, ships, collision_data):
         if not collision_data:
-            return {ship.name: {"rudder_deg": 0, "rpm_percent": 50, "reasoning": "No threats"} 
+            return {ship.name: {"rudder_deg": 0, "rpm_percent": 50, "reasoning": "No threats"}
                     for ship in ships}
-        
+
         table_text = self.format_analysis_table(ships, collision_data)
         user_message = (f"Coordinate maneuvers for all vessels based on this analysis:\n\n"
                         f"{table_text}\n\nGenerate commands for ALL vessels listed above.")
-        
+
         try:
             if self.provider == 'ollama':
                 content = self._call_ollama(user_message)
@@ -258,37 +291,74 @@ Respond STRICTLY with valid JSON. No extra text."""
                 content = self._call_anthropic(user_message)
             else:
                 content = self._call_openai_compatible(user_message)
-            
+
+
+            # Убираем markdown-блоки
             content = content.replace("```json", "").replace("```", "").strip()
             commands = json.loads(content)
             self.last_status = 'ok'
-            return commands.get('vessel_commands', {})
-            
+
+            # ВАЖНО: возвращаем ПОЛНЫЙ ответ, а не извлечённый vessel_commands
+            # чтобы apply_commands мог найти ключ "vessel_commands"
+            return commands
+
         except Exception as e:
             error_msg = str(e)
             self.last_status = 'error'
             self.last_error = error_msg
             print(f"LLM Coordinator Error ({self.provider}): {error_msg}")
-            return {ship.name: {"rudder_deg": 0, "rpm_percent": 50, "reasoning": f"Error: {error_msg[:50]}"} 
+            print(f"Raw content: {content[:300] if 'content' in dir() else 'N/A'}")
+            return {ship.name: {"rudder_deg": 0, "rpm_percent": 50,
+                                "reasoning": f"Error: {error_msg[:50]}"}
                     for ship in ships}
 
     def apply_commands(self, ships, commands):
+        """
+        Применить команды от LLM к судам.
+        
+        commands может быть в одном из двух форматов:
+        1. {"vessel_commands": {"Ship_1": {...}}} — с обёрткой
+        2. {"Ship_1": {...}, "Ship_2": {...}} — без обёртки (уже извлечено)
+        """
+        if not commands:
+            print("No commands received from LLM")
+            return
+
+        # Определяем формат
+        vessel_commands = None
+
+        if isinstance(commands, dict):
+            if "vessel_commands" in commands:
+                # Формат 1: с обёрткой
+                vessel_commands = commands["vessel_commands"]
+            else:
+                # Формат 2: без обёртки — имена судов как ключи
+                ship_names = [s.name for s in ships]
+                if any(name in commands for name in ship_names):
+                    vessel_commands = commands
+                else:
+                    print(f"Unexpected format. Keys: {list(commands.keys())}")
+                    return
+
+        if not vessel_commands:
+            print(f"No vessel commands found. Type: {type(commands)}")
+            return
+
+        #print(f"Applying commands to {len(vessel_commands)} vessels")
+
         for ship in ships:
-            if ship.name in commands:
-                cmd = commands[ship.name]
-                target_rudder = cmd.get('rudder_deg', 0)
-                target_rpm = cmd.get('rpm_percent', 50)
-                
-                rudder_diff = target_rudder - ship.rudder_cmd
-                if abs(rudder_diff) > 5:
-                    ship.rudder_cmd += np.sign(rudder_diff) * 5
-                else:
-                    ship.rudder_cmd = target_rudder
-                
-                rpm_diff = target_rpm - ship.rpm_cmd
-                if abs(rpm_diff) > 10:
-                    ship.rpm_cmd += np.sign(rpm_diff) * 10
-                else:
-                    ship.rpm_cmd = target_rpm
-                
+            if ship.name in vessel_commands:
+                cmd = vessel_commands[ship.name]
+
+                rudder = cmd.get("rudder_deg", 0)
+                rpm = cmd.get("rpm_percent", 50)
+                reasoning = cmd.get("reasoning", "No reasoning provided")
+
+                ship.apply_llm_command(rudder, rpm)
                 ship.llm_decision = cmd
+                ship.llm_reasoning = reasoning
+
+                #print(f"OK {ship.name}: rudder={rudder} deg, rpm={rpm}%, reasoning={reasoning[:60]}")
+            else:
+                if ship.llm_controlled:
+                    print(f"Warning: {ship.name} not found in LLM commands")

@@ -1,0 +1,22 @@
+{
+  "vessels": [
+    {
+      "name": "Ship_1",
+      "x": 0.0,
+      "y": -4011.124845488257,
+      "course_deg": 0.0,
+      "speed_ms": 5.0,
+      "rudder_deg": 0.0,
+      "rpm_percent": 50.0
+    },
+    {
+      "name": "Ship_3",
+      "x": -6017.305315203956,
+      "y": 1.236093943139167,
+      "course_deg": 45.0,
+      "speed_ms": 5.0,
+      "rudder_deg": 0.0,
+      "rpm_percent": 40.0
+    }
+  ]
+}
