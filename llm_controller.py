@@ -77,9 +77,11 @@ class LLMCoordinator:
             self.api_key = None
 
         self.system_prompt = """You are an AI Vessel Traffic Controller.
-You receive PRE-CALCULATED data. Your ONLY task: output rudder and RPM values.
-You do NOT determine COLREG rules. Rules are already determined by the code.
-You do NOT calculate CPA/TCPA. These are already calculated.
+You receive ship position data. Your first priority is to maintain ship safety. 
+Your second priority is to maintain the course set for the vessel using base_heading_deg (return to it is nessesary) if ship is in safe situation. 
+To achive that your ONLY task is to define and output rudder and RPM values.
+You do NOT determine COLREG rules. Rules are already determined by the maritime code.
+
 
 INPUT FORMAT (JSON):
 {
@@ -125,30 +127,30 @@ RULES (follow strictly):
 1. STATUS PRIORITY:
    - If status == "MUST_YIELD" -> you MUST maneuver (change rudder or RPM).
    - If status == "HOLD_COURSE" -> keep rudder=0, rpm=50 (maintain course and speed).
-   - If status == "RETURN_TO_COURSE" -> gradually steer toward base_heading_deg.
-   - If a ship is MUST_YIELD for one pair but HOLD_COURSE for another -> MUST_YIELD wins.
+   - If status == "RETURN_TO_COURSE" -> gradually steer toward base_heading_deg set for this ship.
+   - If a ship is MUST_YIELD for one pair but HOLD_COURSE for another -> choose MUST_YIELD.
 
-2. MANEUVER DIRECTION (HARD RULE):
+2. MANEUVER DIRECTION (HARD RULE) used when there are other ships nearby:
    - ALWAYS prefer STARBOARD turn (positive rudder).
-   - CRITICAL CONVERGENCE (Rule 17.2 / Emergency / CPA < 1000m): YOU MUST TURN STARBOARD. Port turn (negative rudder) is STRICTLY FORBIDDEN in emergencies.
+   - CRITICAL CONVERGENCE (Rule 17.2 / Emergency / CPA < 1000 meters): YOU MUST TURN STARBOARD. Port turn (negative rudder) is STRICTLY FORBIDDEN in emergencies.
    - If no_left_turn == true -> rudder_deg MUST be >= 0. Negative values are FORBIDDEN.
    - If status == "HOLD_COURSE" -> rudder_deg MUST be 0, rpm_percent MUST be 50. NO MANEUVERS ALLOWED for stand-on vessels.
    - If status == "MUST_YIELD" -> rudder_deg MUST be >= 0 (STARBOARD turn ONLY). NEGATIVE RUDDER IS STRICTLY FORBIDDEN.
    - If status == "RETURN_TO_COURSE" -> small rudder toward base_heading, max +/-10 deg.
 
 3. MANEUVER MAGNITUDE:
-   - For Rule 14 (head-on): rudder 15-25 deg starboard.
-   - For Rule 15 (crossing, give-way): rudder 15-25 deg starboard.
-   - For Rule 13 (overtaking): rudder 10-20 deg away from overtaken vessel.
-   - For Rule 17.2 (critical convergence / emergency): rudder 20-35 deg STARBOARD. Reduce RPM to 30-40% if CPA < 500m.
-   - Smooth changes: max 15 deg rudder change per step.
+   - For Rule 14 (head-on): rudder should be from 15 to 25 deg starboard.
+   - For Rule 15 (crossing, give-way): rudder should be from 15 to 25 deg starboard.
+   - For Rule 13 (overtaking): rudder should be from 10 to 20 deg away from overtaken vessel.
+   - For Rule 17.2 (critical convergence / emergency): rudder should be from 20 to 35 deg STARBOARD. Reduce RPM to 30-40% if CPA < 500 meters.
+   - In other situations apply smooth changes: max 15 deg rudder change per step.
 
 4. RETURN TO BASE COURSE:
    - If status == "RETURN_TO_COURSE":
-     * Calculate direction to base_heading_deg.
-     * Use small rudder (5-10 deg) toward base course.
-     * If heading_diff_deg < 5 deg -> set rudder=0 (course restored).
-     * Maintain RPM at 50% during return.
+     * Calculate rudder needed to base_heading_deg.
+     * Use small rudder (from -10 to 10 deg) toward base course. Negative rudder is allowed if it leades to faster return to base_heading_deg.
+     * If you defined that heading_diff_deg < abs(3) deg -> output rudder equal to 0 (course restored).
+     * Maintain RPM at 50% during the return to base course.
 
 5. ECO-MODE:
    - Prefer rudder changes over RPM changes.
@@ -156,7 +158,7 @@ RULES (follow strictly):
    - If reducing RPM: min 30%, never 0%.
 
 6. NO MANEUVER NEEDED:
-   - If status == "HOLD_COURSE" AND not returning -> rudder=0, rpm=50.
+   - If status == "HOLD_COURSE" AND not returning -> output rudder=0, rpm=50.
 
 Respond with valid JSON only. No markdown, no explanation outside JSON."""
 
@@ -165,7 +167,7 @@ Respond with valid JSON only. No markdown, no explanation outside JSON."""
         self.last_error = None
 
     def test_connection(self):
-        """Проверка подключения к провайдеру. Возвращает (success, message)"""
+        """Provider connection check. Return (success, message)"""
         try:
             if self.provider == 'ollama':
                 r = requests.get('http://localhost:11434/api/tags', timeout=5)
@@ -173,15 +175,15 @@ Respond with valid JSON only. No markdown, no explanation outside JSON."""
                     models = r.json().get('models', [])
                     model_names = [m.get('name', '') for m in models]
                     if any(self.model in m for m in model_names):
-                        return True, f"Ollama запущена, модель {self.model} доступна"
+                        return True, f"ollama is launched, model {self.model} is available"
                     else:
-                        return False, f"Модель {self.model} не найдена. Доступны: {', '.join(model_names[:5])}"
+                        return False, f"Model {self.model} is not accessible. Available: {', '.join(model_names[:5])}"
                 else:
-                    return False, "Ollama вернула ошибку"
+                    return False, "ollama returned an error"
 
             elif self.provider == 'anthropic':
                 if not self.api_key:
-                    return False, "API ключ не установлен"
+                    return False, "API key is not set"
                 headers = {
                     'x-api-key': self.api_key,
                     'anthropic-version': '2023-06-01'
@@ -193,13 +195,13 @@ Respond with valid JSON only. No markdown, no explanation outside JSON."""
                 }
                 r = requests.post(self.url, json=payload, headers=headers, timeout=10)
                 if r.status_code == 200:
-                    return True, "Подключение к Anthropic успешно"
+                    return True, "Connection to Anthropic is sucessful"
                 else:
-                    return False, f"Ошибка {r.status_code}: {r.text[:100]}"
+                    return False, f"Error {r.status_code}: {r.text[:100]}"
 
             else:  # OpenAI-совместимые API
                 if not self.api_key:
-                    return False, "API ключ не установлен"
+                    return False, "API key is not set"
                 headers = {'Authorization': f'Bearer {self.api_key}'}
                 payload = {
                     'model': self.model,
@@ -219,8 +221,8 @@ Respond with valid JSON only. No markdown, no explanation outside JSON."""
 
     def format_analysis_table(self, ships, collision_data):
         """Форматирование данных для LLM.
-        collision_data — словарь {'ships': [...]} от collect_collision_data().
-        Передаём как JSON — LLM получает готовые факты, не сырые данные.
+        collision_data — disctionary {'ships': [...]} от collect_collision_data().
+        Use JSON format — LLM resive only sctructured data.
         """
         import json
         return json.dumps(collision_data, indent=2, ensure_ascii=False)
@@ -293,12 +295,12 @@ Respond with valid JSON only. No markdown, no explanation outside JSON."""
                 content = self._call_openai_compatible(user_message)
 
 
-            # Убираем markdown-блоки
+            # Remove possible markdown-блоки
             content = content.replace("```json", "").replace("```", "").strip()
             commands = json.loads(content)
             self.last_status = 'ok'
 
-            # ВАЖНО: возвращаем ПОЛНЫЙ ответ, а не извлечённый vessel_commands
+            # Note: возвращаем ПОЛНЫЙ ответ, а не извлечённый vessel_commands
             # чтобы apply_commands мог найти ключ "vessel_commands"
             return commands
 
