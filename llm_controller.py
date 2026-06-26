@@ -220,8 +220,8 @@ Respond with valid JSON only. No markdown, no explanation outside JSON."""
             return False, f"Ошибка: {str(e)[:100]}"
 
     def format_analysis_table(self, ships, collision_data):
-        """Форматирование данных для LLM.
-        collision_data — disctionary {'ships': [...]} от collect_collision_data().
+        """Preparing data for LLM.
+        collision_data — disctionary {'ships': [...]} from collect_collision_data().
         Use JSON format — LLM resive only sctructured data.
         """
         import json
@@ -295,13 +295,13 @@ Respond with valid JSON only. No markdown, no explanation outside JSON."""
                 content = self._call_openai_compatible(user_message)
 
 
-            # Remove possible markdown-блоки
+            # Remove possible markdown-blocks
             content = content.replace("```json", "").replace("```", "").strip()
             commands = json.loads(content)
             self.last_status = 'ok'
 
-            # Note: возвращаем ПОЛНЫЙ ответ, а не извлечённый vessel_commands
-            # чтобы apply_commands мог найти ключ "vessel_commands"
+            # Note: return full response, not truncated 
+            # allowing apply_commands to identify "vessel_commands"
             return commands
 
         except Exception as e:
@@ -316,25 +316,27 @@ Respond with valid JSON only. No markdown, no explanation outside JSON."""
 
     def apply_commands(self, ships, commands):
         """
-        Применить команды от LLM к судам.
+        Apply LLM command to ship.
         
-        commands может быть в одном из двух форматов:
-        1. {"vessel_commands": {"Ship_1": {...}}} — с обёрткой
-        2. {"Ship_1": {...}, "Ship_2": {...}} — без обёртки (уже извлечено)
+        Commands can be:
+        
+        1. {"vessel_commands": {"Ship_1": {...}}} — with additional text
+        2. {"Ship_1": {...}, "Ship_2": {...}} — without additional text
+        
         """
         if not commands:
             print("No commands received from LLM")
             return
 
-        # Определяем формат
+        # Detect command format (1 or 2)
         vessel_commands = None
 
         if isinstance(commands, dict):
             if "vessel_commands" in commands:
-                # Формат 1: с обёрткой
+                # Format 1
                 vessel_commands = commands["vessel_commands"]
             else:
-                # Формат 2: без обёртки — имена судов как ключи
+                # Format 2
                 ship_names = [s.name for s in ships]
                 if any(name in commands for name in ship_names):
                     vessel_commands = commands

@@ -6,12 +6,16 @@ class Ship:
     def __init__(self, x, y, psi_deg, speed_ms, name=None):
         Ship._counter += 1
         self.id = Ship._counter
-        self.name = name or f"Ship_{self.id}"
-        self.x = float(x)
-        self.y = float(y)
-        self.psi = np.deg2rad(float(psi_deg))
-        self.u = float(speed_ms)
-        self.r = 0.0
+        self.name = name or f"Ship_{self.id}" # Name of the ship for the GUI
+        
+        self.x = float(x) # Current 2D spatial coordinates of the vessel in meters
+        self.y = float(y) # Current 2D spatial coordinates of the vessel in meters
+        
+        self.base_x = float(x) # Recording an initial coordinates for future return to base course
+        self.base_y = float(y) # Recording an initial coordinates for future return to base course
+        self.psi = np.deg2rad(float(psi_deg)) # Current heading (yaw angle) of the ship, converted from degrees to radians
+        self.u = float(speed_ms) # Current forward speed of the ship in meters per second
+        self.r = 0.0 # Current rate of turn (yaw rate) in radians per second
         self.T_psi = 30.0
         self.K_psi = 0.01
         self.T_v = 50.0
@@ -31,8 +35,8 @@ class Ship:
         self.llm_controlled = False
         self.llm_decision = None
         self.base_heading_deg = float(psi_deg)
-        self.in_maneuver = False
-        self.llm_reasoning = ""  # Обоснование решения LLM
+        self.in_maneuver = False # True if ship's current heading (self.psi) deviates by more than 2 degrees from its base_heading_deg
+        self.llm_reasoning = ""  # LLM desicion reasoning
 
     def update(self, dt):
         tau_c = np.clip(self.rudder_cmd * np.pi / 180 * (20 / 35), -20, 20)
@@ -53,13 +57,13 @@ class Ship:
             self.history_x.pop(0)
             self.history_y.pop(0)
 
-    def get_heading_deg(self):
+    def get_heading_deg(self): # Convert ship's heading from radians into a standard compass heading (in degrees)
         return np.mod(np.rad2deg(self.psi), 360)
 
-    def distance_to(self, px, py):
+    def distance_to(self, px, py): # calculates the exact straight-line distance between the ship's current position and any other specific point on the map
         return np.sqrt((self.x - px) ** 2 + (self.y - py) ** 2)
 
-    def get_pentagon_vertices(self):
+    def get_pentagon_vertices(self): # UI function
         half_width = self.width / 2
         bow_x = self.length / 2
         stern_x = -self.length / 2
@@ -77,7 +81,7 @@ class Ship:
     def toggle_llm_control(self, enable=True):
         self.llm_controlled = enable
 
-    def apply_llm_command(self, rudder_deg, rpm_percent):
+    def apply_llm_command(self, rudder_deg, rpm_percent): # Converts LLM rudder commands into actionalble changes (with phisical boundaries)
         rudder_diff = rudder_deg - self.rudder_cmd
         if abs(rudder_diff) > 5:
             self.rudder_cmd += np.sign(rudder_diff) * 5
@@ -89,7 +93,7 @@ class Ship:
         else:
             self.rpm_cmd = rpm_percent
 
-    def get_llm_status_text(self):
+    def get_llm_status_text(self): # UI function, generate  pop-up text attached to the ship
         if not self.llm_controlled:
             return ""
         if self.llm_decision:
@@ -109,5 +113,7 @@ class Ship:
             f"{self.rpm_cmd:.1f}"
         ]
     def set_base_heading(self, heading_deg):
-        """Установить новый базовый курс (например, после Load Task)"""
+        """Set a new base heading degree and position (e.g., after Load Task)"""
+        self.base_x = self.x
+        self.base_y = self.y
         self.base_heading_deg = float(heading_deg)
