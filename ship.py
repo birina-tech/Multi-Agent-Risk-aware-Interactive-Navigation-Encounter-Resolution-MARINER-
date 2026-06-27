@@ -35,7 +35,7 @@ class Ship:
         self.llm_controlled = False
         self.llm_decision = None
         self.base_heading_deg = float(psi_deg)
-        self.in_maneuver = False # True if ship's current heading (self.psi) deviates by more than 2 degrees from its base_heading_deg
+        self.in_maneuver = False # True if ship's current heading (self.psi) deviates by more than 1 degrees from its base_heading_deg
         self.llm_reasoning = ""  # LLM desicion reasoning
 
     def update(self, dt):

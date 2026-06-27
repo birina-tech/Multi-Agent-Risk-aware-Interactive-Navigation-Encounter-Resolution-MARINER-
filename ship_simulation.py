@@ -42,7 +42,7 @@ class MainWindow(QMainWindow):
         self.rec_session_path = None
         self.log_files = {}
         self.tasks_dir = os.path.join(os.getcwd(), "Tasks")
-        self.llm_worker = None
+        self.llm_workers = {}
         self.llm_pending = False
         self.move_mode = False
         self.move_ship = None
@@ -50,6 +50,14 @@ class MainWindow(QMainWindow):
         self.init_ui()
         self.timer = QTimer()
         self.timer.timeout.connect(self.simulation_step)
+
+
+    def closeEvent(self, event):
+        """Intercepts the window close event to clean up threads gracefully."""
+        self.statusBar().showMessage("Shutting down workers, please wait...")
+        self.stop_simulation()
+        event.accept()
+
 
     def init_menu(self):
         menu_bar = self.menuBar()
@@ -743,13 +751,21 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Simulation started")
             self.update_rec_button_state()
 
+
     def stop_simulation(self):
         self.running = False
         self.timer.stop()
-        if self.llm_worker and self.llm_worker.isRunning():
-            self.llm_worker.stop()
-            self.llm_worker.wait(2000)
-            self.llm_pending = False
+        
+        # Stop all active multi-agent workers
+        if hasattr(self, 'llm_workers'):
+            for worker in self.llm_workers.values():
+                if worker.isRunning():
+                    worker.stop()
+                    worker.wait(2000)
+            self.llm_workers.clear()
+            
+        self.llm_pending = False
+        
         if self.recording:
             self.toggle_recording()
         self.btn_start.setStyleSheet("""
@@ -771,6 +787,8 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Simulation stopped")
         self.update_rec_button_state()
 
+
+
     def clear_ships(self):
         if self.recording:
             self.toggle_recording()
@@ -784,147 +802,184 @@ class MainWindow(QMainWindow):
         self.update_rec_button_state()
         self.canvas.update_plot(self.ships, self.running, self.simulation_time)
 
-    def collect_collision_data(self):
-        """
-        Собрать данные для LLM в формате {'ships': [...]}
-        """
+
+
+    def collect_ego_data(self, ego_ship):  # Collects collision matrix strictly from the perspective of the ego_ship.
+
         from colreg_rules import determine_colreg_situation
         from collision_analyzer import CollisionAnalyzer
         
         analyzer = CollisionAnalyzer()
-        ship_data_list = []
+        pairs_info = []
+        must_yield = False
+        no_left_turn = False
+        all_passed = True
         
-        for ship in self.ships:
-            pairs_info = []
-            must_yield = False
-            no_left_turn = False
-            all_passed = True
+        for other in self.ships:
+            if other is ego_ship:
+                continue
+                
+            cpa_data = analyzer.calculate_cpa_tcpa(ego_ship, other)
+            colreg = determine_colreg_situation(
+                ego_ship, other,
+                cpa_data['dist'], cpa_data['DCPA'], cpa_data['TCPA']
+            )
             
-            for other in self.ships:
-                if other is ship:
-                    continue
-                
-                cpa_data = analyzer.calculate_cpa_tcpa(ship, other)
-                colreg = determine_colreg_situation(
-                    ship, other,
-                    cpa_data['dist'], cpa_data['DCPA'], cpa_data['TCPA']
-                )
-                
-                action = colreg['ship1_action']
-                if 'Give-way' in action or 'Alter' in action or 'Change' in action:
-                    role = 'GIVE_WAY'
-                    must_yield = True
-                elif 'Stand on' in action:
-                    role = 'STAND_ON'
-                else:
-                    role = 'BOTH_ALTER'
-                    must_yield = True
-                
-                # Проверяем пересечение по носу
-                crossing = analyzer.calculate_course_crossing(ship, other)
-                crosses_ahead = None
-                if crossing['crossing_type']:
-                    if crossing['crosses_1_by_2']:
-                        crosses_ahead = f"{other.name} crosses {ship.name} ahead"
-                    elif crossing['crosses_2_by_1']:
-                        crosses_ahead = f"{ship.name} crosses {other.name} ahead"
-                
-                if role == 'GIVE_WAY' and crosses_ahead and f"{other.name} crosses" in crosses_ahead:
-                    no_left_turn = True
-                
-                # Проверяем, разошлись ли суда
-                tcpa_val = cpa_data['TCPA']
-                if np.isinf(tcpa_val) or tcpa_val > 0:
-                    all_passed = False
-                
-                pairs_info.append({
-                    'other_ship': other.name,
-                    'rule': colreg['rule'],
-                    'role': role,
-                    'cpa_m': float(cpa_data['DCPA']),
-                    'tcpa_s': float(tcpa_val) if not np.isinf(tcpa_val) else 99999.0,
-                    'crosses_ahead': crosses_ahead
-                })
-            
-            # Определяем статус
-            current_heading = ship.get_heading_deg()
-            heading_diff = abs((ship.base_heading_deg - current_heading + 180) % 360 - 180)
-            returning = all_passed and heading_diff > 2 and ship.in_maneuver
-            
-            if returning:
-                status = 'RETURN_TO_COURSE'
-            elif must_yield:
-                status = 'MUST_YIELD'
+            action = colreg['ship1_action']
+            if 'Give-way' in action or 'Alter' in action or 'Change' in action:
+                role = 'GIVE_WAY'
+                must_yield = True
+            elif 'Stand on' in action:
+                role = 'STAND_ON'
             else:
-                status = 'HOLD_COURSE'
+                role = 'BOTH_ALTER'
+                must_yield = True
             
-            ship_data_list.append({
-                'name': ship.name,
-                'current_heading_deg': float(current_heading),
-                'base_heading_deg': float(ship.base_heading_deg),
-                'heading_diff_deg': float(heading_diff),
-                'speed_ms': float(ship.u),
-                'current_rudder': float(ship.rudder_cmd),
-                'current_rpm': float(ship.rpm_cmd),
-                'status': status,
-                'no_left_turn': no_left_turn,
-                'in_maneuver': ship.in_maneuver,
-                'pairs': pairs_info
+            # Check trajectories 
+            crossing = analyzer.calculate_course_crossing(ego_ship, other)
+            crosses_ahead = None
+            if crossing['crossing_type']:
+                if crossing['crosses_1_by_2']:
+                    crosses_ahead = f"{other.name} crosses {ego_ship.name} ahead"
+                elif crossing['crosses_2_by_1']:
+                    crosses_ahead = f"{ego_ship.name} crosses {other.name} ahead"
+            
+            if role == 'GIVE_WAY' and crosses_ahead and f"{other.name} crosses" in crosses_ahead:
+                no_left_turn = True
+            
+            # Check if vessels are still on collision course
+            tcpa_val = cpa_data['TCPA']
+            if np.isinf(tcpa_val) or tcpa_val > 0:
+                all_passed = False
+
+            pairs_info.append({
+                'other_ship': other.name,
+                'rule': colreg['rule'],
+                'role': role,
+                'cpa_m': float(cpa_data['DCPA']),
+                'tcpa_s': float(cpa_data['TCPA']) if not np.isinf(cpa_data['TCPA']) else 99999.0,
+                'crosses_ahead': crosses_ahead
             })
+
+        # Calculate status outside the loop
+        current_heading = ego_ship.get_heading_deg()
+        heading_diff = abs((ego_ship.base_heading_deg - current_heading + 180) % 360 - 180)
+        returning = all_passed and heading_diff > 1 and ego_ship.in_maneuver
         
-        return {'ships': ship_data_list}
+        if returning:
+            status = 'RETURN_TO_COURSE'
+        elif must_yield:
+            status = 'MUST_YIELD'
+        else:
+            status = 'HOLD_COURSE'
+        
+        # Return a single dictionary for this specific ego_ship
+        return {
+            'name': ego_ship.name,
+            'current_heading_deg': float(current_heading),
+            'base_heading_deg': float(ego_ship.base_heading_deg),
+            'heading_diff_deg': float(heading_diff),
+            'speed_ms': float(ego_ship.u),
+            'current_rudder': float(ego_ship.rudder_cmd),
+            'current_rpm': float(ego_ship.rpm_cmd),
+            'status': status,
+            'no_left_turn': no_left_turn,
+            'in_maneuver': ego_ship.in_maneuver,
+            'pairs': pairs_info
+        }
 
-    def on_llm_result(self, commands):
-        self.llm_pending = False
-        if self.llm_coordinator:
-            self.llm_coordinator.apply_commands(self.ships, commands)
 
-        # Сбрасываем флаг манёвра для судов, которые вернулись на курс
-        for ship in self.ships:
-            if ship.llm_controlled:
-                heading_diff = abs((ship.base_heading_deg - ship.get_heading_deg() + 180) % 360 - 180)
-                if heading_diff < 2 and ship.rudder_cmd == 0:
-                    ship.in_maneuver = False
 
-        self.statusBar().showMessage(f"LLM commands applied at t={self.simulation_time:.1f}s")
+    def on_llm_result(self, ship_name, command):
+        # Find the ship by name
+        ship = next((s for s in self.ships if s.name == ship_name), None)
+        if ship:
+            rudder = command.get("rudder_deg", 0)
+            rpm = command.get("rpm_percent", 50)
+            reasoning = command.get("reasoning", "No reasoning provided")
 
-    def on_llm_error(self, error_msg):
-        self.llm_pending = False
-        print(f"LLM Worker Error: {error_msg}")
-        self.statusBar().showMessage(f"LLM Error: {error_msg[:50]}")
+            ship.apply_llm_command(rudder, rpm)
+            ship.llm_decision = command
+            ship.llm_reasoning = reasoning
+            
+        # Reset maneuver flag if returned to course
+        heading_diff = abs((ship.base_heading_deg - ship.get_heading_deg() + 180) % 360 - 180)
+        if heading_diff < 1 and ship.rudder_cmd == 0:
+            ship.in_maneuver = False
 
-    def start_llm_worker(self, collision_data):
-        if self.llm_pending:
-            return
-        coordinator = self.get_or_create_coordinator()
-        self.llm_worker = LLMWorker(coordinator, self.ships, collision_data)
-        self.llm_worker.result_ready.connect(self.on_llm_result)
-        self.llm_worker.error_occurred.connect(self.on_llm_error)
-        self.llm_pending = True
-        self.llm_worker.start()
-        self.statusBar().showMessage(f"LLM query sent at t={self.simulation_time:.1f}s (async)")
+        self.statusBar().showMessage(f"LLM applied for {ship_name} at t={self.simulation_time:.1f}s")
+
+    def on_llm_error(self, ship_name, error_msg):
+        print(f"LLM Error for {ship_name}: {error_msg}")
+
+
 
     def simulation_step(self):
         if self.running:
             llm_ships = [s for s in self.ships if s.llm_controlled]
-            
-            if (llm_ships and 
-                    (self.simulation_time - self.last_llm_update >= self.llm_update_interval) and
-                    not self.llm_pending):
-                collision_data = self.collect_collision_data()
-                if collision_data:
-                    self.start_llm_worker(collision_data)
-                self.last_llm_update = self.simulation_time
-            
-            for ship in self.ships:
-                # Помечаем судно как "в манёвре", если оно отклонилось от курса
-                heading_diff = abs((ship.base_heading_deg - ship.get_heading_deg() + 180) % 360 - 180)
-                if heading_diff > 2:
-                    ship.in_maneuver = True
                 
+            # Check if it's time for a new batch of LLM requests
+            if llm_ships and (self.simulation_time - self.last_llm_update >= self.llm_update_interval):
+                coordinator = self.get_or_create_coordinator()
+                    
+                # Ensure the workers dictionary exists
+                if not hasattr(self, 'llm_workers'):
+                    self.llm_workers = {}
+                        
+                for ship in llm_ships:
+                    # Safely check if a worker is already running for this ship
+                    worker_active = False
+                    if ship.name in self.llm_workers:
+                        try:
+                            # If it returns True, it is still working
+                            if self.llm_workers[ship.name].isRunning():
+                                worker_active = True
+                        except RuntimeError:
+                            # C++ object was safely deleted by deleteLater, but the Python reference remained.
+                            # Delete the zombie reference from our dictionary.
+                            del self.llm_workers[ship.name]
+
+                    # If no worker is active, spawn a new one
+                    if not worker_active:
+                        ego_data = self.collect_ego_data(ship)
+                            
+                        if ego_data:
+                            # Create and start a dedicated worker for this ship
+                            worker = LLMWorker(coordinator, ship.name, ego_data)
+                            worker.result_ready.connect(self.on_llm_result)
+                            worker.error_occurred.connect(self.on_llm_error)
+                            
+                            # Tell the thread to safely delete its C++ memory when done
+                            worker.finished.connect(worker.deleteLater)
+                                
+                            # Store reference to prevent Python garbage collection while running
+                            self.llm_workers[ship.name] = worker
+                            worker.start()
+                    
+                self.last_llm_update = self.simulation_time
+                    
+                # Update status bar based on active workers
+                active_count = 0
+                for w in self.llm_workers.values():
+                    try:
+                        if w.isRunning():
+                            active_count += 1
+                    except RuntimeError:
+                        pass
+                        
+                if active_count > 0:
+                    self.statusBar().showMessage(f"Sent {active_count} parallel LLM requests at t={self.simulation_time:.1f}s")
+                
+            # Physical update loop for all ships
+            for ship in self.ships:
+                # Marking vessel as 'in_maneuver' if not on course
+                heading_diff = abs((ship.base_heading_deg - ship.get_heading_deg() + 180) % 360 - 180)
+                if heading_diff > 1:
+                    ship.in_maneuver = True
+                    
                 ship.update(self.dt)
                 self.log_ship_state(ship)
-            
+                
             self.simulation_time += self.dt
             self.canvas.update_plot(self.ships, self.running, self.simulation_time)
 

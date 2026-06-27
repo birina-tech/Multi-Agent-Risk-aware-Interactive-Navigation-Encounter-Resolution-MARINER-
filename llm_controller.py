@@ -76,50 +76,40 @@ class LLMCoordinator:
         else:
             self.api_key = None
 
-        self.system_prompt = """You are an AI Vessel Traffic Controller.
-You receive ship position data. Your first priority is to maintain ship safety. 
-Your second priority is to maintain the course set for the vessel using base_heading_deg (return to it is nessesary) if ship is in safe situation. 
-To achive that your ONLY task is to define and output rudder and RPM values.
-You do NOT determine COLREG rules. Rules are already determined by the maritime code.
-
+        self.system_prompt = """You are an AI Autopilot for a specific marine vessel (the "ego vessel").
+You receive your current telemetry and a list of other vessels in your vicinity and thier current coordinates and heading.
+Your first priority is safety following COLREGs rules. 
+Your second priority, if vessel is safe, is to maintain or return to your base_heading_deg.
 
 INPUT FORMAT (JSON):
 {
-  "ships": [
+  "name": "Ship_1",
+  "current_heading_deg": 45,
+  "base_heading_deg": 45,
+  "heading_diff_deg": 15,
+  "speed_ms": 5.0,
+  "current_rudder": 0,
+  "current_rpm": 50,
+  "status": "MUST_YIELD" | "HOLD_COURSE" | "RETURN_TO_COURSE",
+  "no_left_turn": true | false,
+  "in_maneuver": true | false,
+  "pairs": [
     {
-      "name": "Ship_1",
-      "current_heading_deg": 45,
-      "base_heading_deg": 45,
-      "heading_diff_deg": 15,
-      "speed_ms": 5.0,
-      "current_rudder": 0,
-      "current_rpm": 50,
-      "status": "MUST_YIELD" | "HOLD_COURSE" | "RETURN_TO_COURSE",
-      "no_left_turn": true | false,
-      "in_maneuver": true | false,
-      "pairs": [
-        {
-          "other_ship": "Ship_2",
-          "rule": "14" | "15" | "13" | "17.2",
-          "role": "GIVE_WAY" | "STAND_ON" | "BOTH_ALTER",
-          "cpa_m": 500,
-          "tcpa_s": 120,
-          "crosses_ahead": "Ship_2 crosses Ship_1 ahead" | null
-        }
-      ]
+      "other_ship": "Ship_2",
+      "rule": "14" | "15" | "13" | "17.2",
+      "role": "GIVE_WAY" | "STAND_ON" | "BOTH_ALTER",
+      "cpa_m": 500,
+      "tcpa_s": 120,
+      "crosses_ahead": "Ship_2 crosses Ship_1 ahead" | null
     }
   ]
 }
 
 OUTPUT FORMAT (strict JSON only, no extra text):
 {
-  "vessel_commands": {
-    "Ship_1": {
-      "rudder_deg": 15,
-      "rpm_percent": 50,
-      "reasoning": "Brief explanation: Rule 15 give-way vessel, turning starboard to pass astern"
-    }
-  }
+  "rudder_deg": 15,
+  "rpm_percent": 50,
+  "reasoning": "Brief explanation of your maneuver based on the rules."
 }
 
 RULES (follow strictly):
@@ -149,7 +139,7 @@ RULES (follow strictly):
    - If status == "RETURN_TO_COURSE":
      * Calculate rudder needed to base_heading_deg.
      * Use small rudder (from -10 to 10 deg) toward base course. Negative rudder is allowed if it leades to faster return to base_heading_deg.
-     * If you defined that heading_diff_deg < abs(3) deg -> output rudder equal to 0 (course restored).
+     * If you defined that heading_diff_deg < abs(1) deg -> output rudder equal to 0 (course restored).
      * Maintain RPM at 50% during the return to base course.
 
 5. ECO-MODE:
@@ -276,6 +266,36 @@ Respond with valid JSON only. No markdown, no explanation outside JSON."""
         response = requests.post(self.url, json=payload, timeout=60)
         response.raise_for_status()
         return response.json()['message']['content']
+
+
+    def get_ego_command(self, collision_data): # Sends a request on behalf of the ego vessel.
+        
+        if not collision_data or not collision_data.get('pairs'):
+            return {"rudder_deg": 0, "rpm_percent": 50, "reasoning": "No threats"}
+
+        # Format the data for ego ship
+        user_message = (f"Determine the maneuver for your vessel based on this telemetry and position and heading of other vessels:\n\n"
+                        f"{json.dumps(collision_data, indent=2)}\n\n"
+                        f"Generate your command.")
+        
+        try:
+            if self.provider == 'ollama':
+                content = self._call_ollama(user_message)
+            elif self.provider == 'anthropic':
+                content = self._call_anthropic(user_message)
+            else:
+                content = self._call_openai_compatible(user_message)
+
+            content = content.replace("```json", "").replace("```", "").strip()
+            command = json.loads(content)
+            self.last_status = 'ok'
+            return command
+
+        except Exception as e:
+            self.last_status = 'error'
+            self.last_error = str(e)
+            return {"rudder_deg": 0, "rpm_percent": 50, "reasoning": f"Error: {str(e)[:50]}"}
+
 
     def get_coordinated_commands(self, ships, collision_data):
         if not collision_data:
